@@ -241,6 +241,7 @@ one.
 | Backfill | Same loop from `INDEXER_START_LEDGER`; archival RPC is configuration, not a code path |
 | API | Read-only REST per the consumer table; WebSocket later, schema-compatible |
 | Uniqueness key | RPC event id (TOID-derived: ledger, tx order, op index, event index), unique-constrained in `events` |
+| Retention | Keep the complete raw event history for the lifetime of the instance; no automatic archival or pruning |
 
 ## Status
 
@@ -260,13 +261,15 @@ shape from issue #346 belong in this document as well; they land as that
 issue closes. Until they do, the schema comments in `indexer/src/schema/`
 and `indexer/migrations/` are the reference for tables and columns.
 
-Two questions were asked after the original design was scoped to a single
+Three questions were asked after the original design was scoped to a single
 contract id, and they are answered here:
 
 1. [One instance per registry deployment](#1-one-instance-per-registry-deployment)
    (issue #365)
 2. [Event shape changes across contract `VERSION`](#2-event-shape-changes-across-contract-version)
    (issue #366)
+3. [Data retention and archival](#3-data-retention-and-archival)
+   (issue #375)
 
 How to actually run an instance is in
 [`INDEXER_DEPLOYMENT.md`](INDEXER_DEPLOYMENT.md). This document does not
@@ -470,3 +473,74 @@ When a contract change will alter a known event's payload:
 
 A `VERSION` bump that does not touch event shapes needs no indexer
 release.
+
+---
+
+## 3. Data retention and archival
+
+**Decision:** keep every successfully ingested raw event in the primary
+database for the full lifetime of an indexer instance. There is no
+age-based expiry, automatic archival tier, aggregation-and-delete job, or
+operator-supported pruning procedure.
+
+This is a deliberate full-retention policy, not the absence of a policy.
+The database grows monotonically, and the operator accepts that storage
+cost in exchange for a complete audit trail.
+
+### Why full retention wins
+
+The raw event log is the indexer's evidence. It records which on-chain
+events produced every answer exposed by the API and makes an independent
+audit possible without trusting a mutable summary. That matters to E19's
+audit-readiness work: a task state or keeper total can be traced to its
+source events rather than accepted as an unexplained database value.
+
+It is also part of the current correctness model, not merely historical
+data. `TaskState`, keeper summaries, admin configuration, leaderboards,
+and protocol statistics are folded from `events` on read. Dropping raw
+rows after writing aggregates would make those aggregates a new source of
+truth and would remove the documented ability to rebuild derived state.
+Doing that safely would require versioned snapshots, reconciliation, and
+restore tooling that the service does not have.
+
+Finally, the upstream RPC retention window is finite. Once an old event
+falls outside that window, a pruned indexer may not be able to reconstruct
+it from the public RPC at all. Moving the only retained copy to a cold
+format would save primary-disk cost but make ordinary audit and support
+queries depend on a second storage system and a restore path. For one
+registry deployment's compact event stream, that complexity is not
+justified by measured storage pressure.
+
+### Cost and operating rules
+
+Full retention means disk use is unbounded over an unbounded service
+lifetime. Operators must therefore treat database capacity as a normal
+resource to provision and monitor:
+
+- Alert on database-file size, free disk, and growth rate early enough to
+  expand or move the volume before writes are affected.
+- Take regular, tested backups of the entire SQLite database. A backup is
+  disaster recovery, not an archive tier: it does not permit deleting the
+  corresponding primary rows.
+- Preserve the database when retiring an old contract deployment. Under
+  the one-instance-per-deployment policy, that read-only database is the
+  historical record for that deployment.
+- Use API pagination and query limits to bound request cost. Those are
+  serving controls and do not change what is retained.
+
+Schema migrations must not delete historical event rows as routine
+maintenance. `VACUUM` may reclaim unused SQLite pages after a migration or
+recovery operation, but it is not a retention mechanism. Manual deletion
+of old rows produces an unsupported, incomplete index and must not be
+presented as a healthy full-history instance.
+
+### Revisit trigger
+
+There is intentionally no time or size threshold that starts deletion.
+If measured growth makes full primary retention operationally
+unacceptable, that is a new design decision and implementation issue. It
+must define, before any row is removed, a versioned archive format,
+integrity manifest, durable destination, restore procedure, and a query
+path that clearly distinguishes online from archived history. Until that
+work is reviewed and shipped, the only supported policy is full retention
+forever.
