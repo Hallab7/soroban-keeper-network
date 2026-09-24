@@ -1,7 +1,9 @@
 # Indexer public API security review
 
-Review date: 2026-09-24  
-Reviewed revision: `8b7ba74`  
+Review date: 2026-09-24
+
+Reviewed revision: `8b7ba74`
+
 Scope: `indexer/src/api/`, `indexer/src/store.rs`,
 `indexer/src/queries/`, the SQLite migrations, `indexer/openapi.yaml`, and
 the committed load-test baseline.
